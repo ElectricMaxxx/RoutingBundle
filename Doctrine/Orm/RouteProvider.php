@@ -12,6 +12,9 @@
 
 namespace Symfony\Cmf\Bundle\RoutingBundle\Doctrine\Orm;
 
+use Doctrine\Common\Persistence\ManagerRegistry;
+use Doctrine\Common\Persistence\ObjectRepository;
+use Symfony\Cmf\Component\Routing\Candidates\CandidatesInterface;
 use Symfony\Component\Routing\RouteCollection;
 use Symfony\Component\Routing\Exception\RouteNotFoundException;
 
@@ -32,29 +35,42 @@ use Symfony\Cmf\Bundle\RoutingBundle\Doctrine\DoctrineProvider;
 class RouteProvider extends DoctrineProvider implements RouteProviderInterface
 {
     /**
-     * @param $url
-     *
-     * @return array
+     * @var CandidatesInterface
      */
-    protected function getCandidates($url)
-    {
-        $candidates = array();
-        if ('/' !== $url) {
-            if (preg_match('/(.+)\.[a-z]+$/i', $url, $matches)) {
-                $candidates[] = $url;
-                $url = $matches[1];
-            }
+    private $candidatesStrategy;
 
-            $part = $url;
-            while (false !== ($pos = strrpos($part, '/'))) {
-                $candidates[] = $part;
-                $part = substr($url, 0, $pos);
-            }
+    public function __construct(ManagerRegistry $managerRegistry, CandidatesInterface $candidatesStrategy, $className)
+    {
+        parent::__construct($managerRegistry, $className);
+        $this->candidatesStrategy = $candidatesStrategy;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function getRouteCollectionForRequest(Request $request)
+    {
+        $url = $request->getPathInfo();
+
+        $candidates = $this->candidatesStrategy->getCandidates($request);
+
+        $collection = new RouteCollection();
+
+        if (empty($candidates)) {
+            return $collection;
         }
 
-        $candidates[] = '/';
+        $routes = $this->getRouteRepository()->findByStaticPrefix($candidates, array('position' => 'ASC'));
+        /** @var $route Route */
+        foreach ($routes as $route) {
+            // TODO: is this still relevant? why does phpcr-odm not do something similar?
+            if (preg_match('/.+\.([a-z]+)$/i', $url, $matches) && $route->getDefault('_format') !== $matches[1]) {
+                $route->setDefault('_format', $matches[1]);
+            }
+            $collection->add($route->getName(), $route);
+        }
 
-        return $candidates;
+        return $collection;
     }
 
     /**
@@ -62,7 +78,11 @@ class RouteProvider extends DoctrineProvider implements RouteProviderInterface
      */
     public function getRouteByName($name)
     {
-        $route = $this->getRoutesRepository()->findOneBy(array('name' => $name));
+        if (!$this->candidatesStrategy->isCandidate($name)) {
+            throw new RouteNotFoundException(sprintf('Route "%s" is not handled by this route provider', $name));
+        }
+
+        $route = $this->getRouteRepository()->findOneBy(array('name' => $name));
         if (!$route) {
             throw new RouteNotFoundException("No route found for name '$name'");
         }
@@ -76,19 +96,16 @@ class RouteProvider extends DoctrineProvider implements RouteProviderInterface
     public function getRoutesByNames($names = null)
     {
         if (null === $names) {
-            $names = array();
             if (0 === $this->routeCollectionLimit) {
-                return $names;
-            }
-            if (null !== $this->routeCollectionLimit) {
-                return $this->getRoutesRepository()->findBy(array(), null, $this->routeCollectionLimit);
+                return array();
             }
 
-            return $this->getRoutesRepository()->findAll();
+            return $this->getRouteRepository()->findBy(array(), null, $this->routeCollectionLimit);
         }
 
         $routes = array();
         foreach ($names as $name) {
+            // TODO: if we do findByName with multivalue, we need to filter with isCandidate afterwards
             try {
                 $routes[] = $this->getRouteByName($name);
             } catch (RouteNotFoundException $e) {
@@ -100,39 +117,9 @@ class RouteProvider extends DoctrineProvider implements RouteProviderInterface
     }
 
     /**
-     * {@inheritDoc}
+     * @return ObjectRepository
      */
-    public function getRouteCollectionForRequest(Request $request)
-    {
-        $url = $request->getPathInfo();
-
-        $candidates = $this->getCandidates($url);
-
-        $collection = new RouteCollection();
-
-        if (empty($candidates)) {
-            return $collection;
-        }
-
-        $routes = $this->getRoutesRepository()->findByStaticPrefix($candidates, array('position' => 'ASC'));
-        foreach ($routes as $key => $route) {
-            if (preg_match('/.+\.([a-z]+)$/i', $url, $matches)) {
-                if ($route->getDefault('_format') === $matches[1]) {
-                    continue;
-                }
-
-                $route->setDefault('_format', $matches[1]);
-            }
-            $collection->add($key, $route);
-        }
-
-        return $collection;
-    }
-
-    /**
-     * @return \Doctrine\Common\Persistence\ObjectRepository
-     */
-    protected function getRoutesRepository()
+    protected function getRouteRepository()
     {
         return $this->getObjectManager()->getRepository($this->className);
     }
